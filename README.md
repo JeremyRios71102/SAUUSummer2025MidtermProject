@@ -1,6 +1,6 @@
 # Cloud-Based Linux Server Performance Remote Dashboard
 
-**Final project for COP3604 – System Administration using UNIX**\
+**Midterm project for COP3604 – System Administration using UNIX**\
 **Group Members:** \
 **Instructor:** Dr. Christian Navarro
 
