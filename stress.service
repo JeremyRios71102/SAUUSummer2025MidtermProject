@@ -1,0 +1,12 @@
+[Unit]
+Description=Stress Test Service
+After=network.target
+
+[Service]
+ExecStart=/home/%u/stress_folder/stress_script.sh
+WorkingDirectory=/home/%u/stress_folder
+Restart=always
+User=%u
+
+[Install]
+WantedBy=multi-user.target
