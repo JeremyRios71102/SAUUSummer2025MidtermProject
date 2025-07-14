@@ -20,3 +20,4 @@ chmod 110 $API
 # Move to PyApi 
 mv data /home/PyApi
 mv $API /home/PyApi
+mv monitor.py /home/PyApi
