@@ -1,183 +1,168 @@
 #!/usr/bin/env python3
 """
-This python script contains the API/agents that will collect the system statistics from the
-Ubuntu 24.02 virtual machine from Google Cloud Console, and send those statistics to our website
-which will display the statistics graphically.
+agent.py – lightweight HTTP agent that reads the latest metrics sample
+emitted by monitor.py through the named pipe /tmp/sysmon_pipe and exposes it
+via /metrics in the exact JSON schema expected by the dashboard:
 
-Setup
+    {
+        "cpu": <float>,    # % CPU usage (2‑dp)
+        "memory": <float>, # % RAM used (2‑dp)
+        "disk": <float>,   # % rootfs used (2‑dp)
+        "diskio": <float>, # aggregate read+write B/s (2‑dp)
+        "net": <float>     # network throughput B/s (2‑dp)
+    }
 
-Before you run this script, be sure to do the following on your virtual machine:
-Install any package updates and Python 3 and dependencies
-sudo apt update && sudo apt install python3-pip -y
-pip install psutil fastapi uvicorn
+Running both of these processes is required:
+    $ python3 monitor.py   # writes metrics to the FIFO
+    $ python3 agent.py     # serves the /metrics endpoint on port 5000
 
-Then, run the code:
-sudo -u python3 agent.py
-Note: You can alternatively create a system service file if you would like to start the program
-on bootup.
+Ubuntu 24.02 (terminal‑only) | Google Cloud Console
 """
-#Required Libraries and Frameworks
-import os
-import time
 import json
-import shutil
+import os
+import re
+import time
 import threading
-import urllib.request
-from http.server import HTTPServer, BaseHTTPRequestHandler
 from collections import OrderedDict
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Dict
 
-#Configuration
-SAMPLE_INTERVAL = 5 #Time (in seconds) between each data collection
-HTTP_PORT = 5000 #Load program at a specific port
-PIPE_PATH = "/tmp/sysmon_pipe" #A basic FIFO for other users
-PRIMARY_DISK = "sda" #Change the rootdisk to the one you're using if needed
-PRIMARY_IFACE = None #None is used to auto-detect which interface to use
+PIPE_PATH = "/tmp/sysmon_pipe"
+HTTP_PORT = 5000
 
-#Low Level Helpers - these functions collect the data manually instead of using psutil
+#This is the format used by monitor.py to collect the data, the format will change for the JSON file
+_PATTERNS: dict[str, re.Pattern[str]] = {
+    "cpu":      re.compile(r"CPU Percent:\s*([\d.]+)"),
+    "memory":   re.compile(r"Memory Percent:\s*([\d.]+)"),
+    "disk":     re.compile(r"Disk Usage:\s*([\d.]+)"),
+    "io_write": re.compile(r"IO Write:\s*(\d+)"),
+    "io_read":  re.compile(r"IO Read:\s*(\d+)"),
+    "net":      re.compile(r"Network Throughput:\s*([\d.]+)"),
+}
 
-#Returns the first line of the file
-def _read_first_line(path):
-    with open(path, "r") as f:
-        return f.readline()
+#These are the number of lines used by the given data from monitor.py
+_LINES_PER_SAMPLE = 6
 
-#Returns the CPU times from /proc/stat
-def _read_proc_stat():
-    return list(map(int, _read_first_line("/proc/stat").split()[1:]))
 
-#Returns the percentage of used memory with a precision of two decimals.
-def _memory_usage():
-    m = {}
-    with open("/proc/meminfo") as f:
-        for line in f:
-            k, v, *_ = line.split()
-            m[k.rstrip(":")] = int(v)
-    total = m["MemTotal"] * 1024
-    free = (m["MemFree"] + m["Buffers"] + m["Cached"]) * 1024
-    used = total - free
-    return round(used / total * 100, 2)
-
-#Returns the percentage of disk usage with a precision of two decimals.
-def _disk_usage(path="/"):
-    total, used, _ = shutil.disk_usage(path)
-    return round(used / total * 100, 2)
-
-#This will map out block devices to a tuple
-def _diskstats():
-    s ={}
-    with open("/proc/diskstats") as f:
-        for line in f:
-            _, _, name, *vals = line.split()
-            s[name] = (int(vals[2]), int(vals[6]))
-        return s
-
-#Returns mapping interface from /proc/net/dev
-def _netdev():
-    d = {}
-    with open("/proc/net/dev") as f:
-        for line in f:
-            if ':' not in line:
-                continue
-            iface, rest = line.split(':', 1)
-            vals = list(map(int, rest.split()))
-            d[iface.strip()] = (vals[0], vals[8])
-    return d
-
-#This will pick the best possible interface heuristically
-def _detect_iface():
-    for iface in _netdev():
-        if iface not in ("lo", "docker0"):
-            return iface
-    raise RuntimeError("There are no suitable network interfaces found. Please try again later. If problems persist, check your network configuration")
-
-#Sampler Thread (background) - The sampler will collect metrics from the background so HTTP requests are served instantly
-class Sampler(threading.Thread):
-    def __init__(self, interval=SAMPLE_INTERVAL):
+class PipeReader(threading.Thread):
+    #Continuously reads the FIFO and keeps the most recent sample.
+    def __init__(self, pipe_path: str = PIPE_PATH) -> None:
         super().__init__(daemon=True)
-        self.interval = interval
-        self.current = {}
+        self.pipe_path = pipe_path
+        self.current: Dict[str, float] = OrderedDict([
+            ("cpu", 0.0),
+            ("memory", 0.0),
+            ("disk", 0.0),
+            ("diskio", 0.0),
+            ("net", 0.0),
+        ])
 
-        #Initializations of counters to be used in delta calculations
-        self._prev_cpu = _read_proc_stat()
-        self._prev_disk = _diskstats()
-        self._prev_net = _netdev()
+        self._prev_io_total: int | None = None
+        self._prev_ts: float | None = None
 
-        #Ensures a basic data pipe is only created once
-        if not os.path.exists(PIPE_PATH):
-            os.mkfifo(PIPE_PATH)
+        #If a FIFO does not exist, a new one will be created.
+        if not os.path.exists(self.pipe_path):
+            os.mkfifo(self.pipe_path)
 
-    def run(self):
-        global PRIMARY_IFACE
-        if PRIMARY_IFACE is None:
-            PRIMARY_IFACE = _detect_iface()
+    #Helper functions
+    @staticmethod
+    def _parse_block(lines: list[str]) -> dict[str, str] | None:
+        #This helper will extract the information given by monitor.py
+        parsed: dict[str, str] = {}
+        for key, regex in _PATTERNS.items():
+            for ln in lines:
+                m = regex.search(ln)
+                if m:
+                    parsed[key] = m.group(1)
+                    break
+            if key not in parsed:  #Will return nothing if the field is blank.
+                return None
+        return parsed
 
+    def _process_block(self, lines: list[str]) -> None:
+        #This helper wiLl process the given info to fit into the five attributes used by the dashboard
+        data_raw = self._parse_block(lines)
+        if not data_raw:
+            return  #If there is no data, return nothing.
+
+        try:
+            #Assigns variable types to each given data value.
+            cpu_pct = float(data_raw["cpu"])
+            mem_pct = float(data_raw["memory"])
+            disk_pct = float(data_raw["disk"])
+            io_write = int(data_raw["io_write"])
+            io_read = int(data_raw["io_read"])
+            net_bps  = float(data_raw["net"])
+        except ValueError:
+            return  #Malformed numbers will be ignored.
+
+        #This portion will calculate the value for the diskio attribute.
+        now = time.time()
+        io_total = io_write + io_read
+        if self._prev_io_total is not None and self._prev_ts is not None:
+            delta_bytes = io_total - self._prev_io_total
+            delta_t     = max(now - self._prev_ts, 1e-6)
+            diskio_bps  = delta_bytes / delta_t
+        else:
+            diskio_bps = 0.0
+
+        self._prev_io_total = io_total
+        self._prev_ts       = now
+
+        #Reformatted monitor.py data to be used by the dashboard.
+        self.current = OrderedDict([
+            ("cpu",    round(cpu_pct, 2)),
+            ("memory", round(mem_pct, 2)),
+            ("disk",   round(disk_pct, 2)),
+            ("diskio", round(diskio_bps, 2)),
+            ("net",    round(net_bps, 2)),
+        ])
+
+    #This loop will create the pipe which will process the data to the dashboard.
+    def run(self) -> None:
         while True:
-            start = time.time()
-
-            #CPU
-            cpu_now = _read_proc_stat()
-            delta = [b - a for a, b in zip(self._prev_cpu, cpu_now)]
-            idle, total = delta[3] + delta[4], sum(delta)
-            cpu_pct = 0.0 if total == 0 else 100 * (total - idle) / total
-            self._prev_cpu = cpu_now
-
-            #Disk I/O in B/s
-            disk_now = _diskstats() [PRIMARY_DISK]
-            rd, wr = disk_now
-            prev_rd, prev_wr = self._prev_disk[PRIMARY_DISK]
-            disk_bps = ((rd - prev_rd) + (wr - prev_wr)) * 512 / self.interval
-            self._prev_disk = _diskstats()
-
-            #Net Throughput B/s
-            net_now = _netdev() [PRIMARY_IFACE]
-            rx, tx = net_now
-            prev_rx, prev_tx = self._prev_net[PRIMARY_IFACE]
-            net_bps = ((rx - prev_rx) + (tx - prev_tx)) / self.interval
-            self._prev_net = _netdev()
-
-            #Sample Assembly
-            sample = OrderedDict([
-                ("cpu", round(cpu_pct, 2)),
-                ("memory", _memory_usage()),
-                ("disk", _disk_usage("/")),
-                ("diskio", round(disk_bps, 2)),
-                ("net", round(net_bps, 2)),
-            ])
-
-            #Save the new results of the metrics
-            self.current = sample
-
-            #This write command will be written to FIFO so 'tail -f' can be used to read the most recent entires.
             try:
-                with open(PIPE_PATH, "w") as fifo:
-                    fifo.write(json.dumps(sample) + "\n")
-            except BrokenPipeError:
-                #Occurs when no reader is attached.
-                pass
+                with open(self.pipe_path, "r") as fifo:
+                    buffer: list[str] = []
+                    for line in fifo:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        buffer.append(line)
+                        if len(buffer) == _LINES_PER_SAMPLE:
+                            self._process_block(buffer)
+                            buffer.clear()
+            except (FileNotFoundError, OSError):
+                #If the pipes haven't been opened yet or if there's no statistics, we retry every half-second.
+                time.sleep(0.5)
 
-            #Sleep until next statistic collection occurs.
-            time.sleep(max(0, self.interval - (time.time() - start)))
-
-#HTTP Handler
+#HTTP communication
 class MetricsHandler(BaseHTTPRequestHandler):
-    #Generates the results in a JSON file to be sent to the dashboard.
-    def do_GET(self):
+    def do_GET(self) -> None:
+        #This will send the system metrics over to the dashboard. It will send 404 if there's an error.
         if self.path == "/metrics":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps(sampler.current).encode())
+            self.wfile.write(json.dumps(reader.current).encode())
         else:
             self.send_error(404)
 
-    def log_message(self, *_):
+    def log_message(self, *_):  #This will remove the default log noise.
         pass
 
 #Main function
-if __name__ == '__main__':
-    #The main program that requests the statistic and to send them to the dashboard.
-    sampler = Sampler(); sampler.start()
-    print(f" [agent] ∆{SAMPLE_INTERVAL}s | /metrics on :{HTTP_PORT} | fifo {PIPE_PATH}")
+def main() -> None:
+    global reader
+    reader = PipeReader()
+    reader.start()
+
+    print(f"[agent] /metrics on :{HTTP_PORT} | fifo {PIPE_PATH}")
     try:
         HTTPServer(("0.0.0.0", HTTP_PORT), MetricsHandler).serve_forever()
     except KeyboardInterrupt:
-        print("\nExiting...")
+        print("\nExiting…")
+
+
+if __name__ == "__main__":
+    main()
