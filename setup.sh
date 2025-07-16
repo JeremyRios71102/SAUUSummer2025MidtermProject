@@ -11,11 +11,12 @@ chown PyApi:PyApi data
 chmod 440 data
 
 # Import Python API
-API="test.py"
+API="agent.py"
 
 # Change Python API Ownership + Permissions
 chown PyApi:PyApi $API
 chmod 110 $API
+chmod 110 monitor.py
 
 # Move to PyApi 
 mv data /home/PyApi
