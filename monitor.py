@@ -3,7 +3,7 @@ import time
 import sys
 
 # Named Pipe Output
-sys.stdout = open('/home/PyApi/data', 'w', buffering = 1)
+sys.stdout = open('/tmp/sysmon_pipe', 'w', buffering = 1)
 
 while True:
     # Network Throughput (Data Out per Second)
