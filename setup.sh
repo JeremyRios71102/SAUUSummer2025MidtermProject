@@ -8,15 +8,15 @@ useradd -m PyApi
 
 # Change Named Piped File Ownership + Permissions
 chown PyApi:PyApi data
-chmod 440 data
+chmod 660 data
 
 # Import Python API
 API="agent.py"
 
 # Change Python API Ownership + Permissions
 chown PyApi:PyApi $API
-chmod 110 $API
-chmod 110 monitor.py
+chmod 440 $API
+chmod 440 monitor.py
 
 # Move to PyApi 
 mv data /home/PyApi
