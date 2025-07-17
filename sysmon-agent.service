@@ -1,0 +1,17 @@
+[Unit]
+Description=SysMon Metrics Agent (HTTP /metrics exporter)
+Wants=network-online.target
+After=network-online.target
+Before=sysmon-monitor.service
+
+[Service]
+Type=simple
+User=jeremyrios711 #Change to your username
+Group=group #Change to your group
+WorkingDirectory=/home/jeremyrios711/sysmon #Change to your agent file directory
+ExecStart=/usr/bin/python3 -u /home/jeremyrios711/sysmon/agent.py #Change to your agent file directory
+Restart=always
+RestartSec=300 #Every 5 minutes
+
+[Install]
+WantedBy=multi-user.target
