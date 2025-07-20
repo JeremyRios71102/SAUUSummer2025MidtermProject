@@ -1,6 +1,6 @@
 # Changelog
 
 ## Updates After Live Demonstration
-- Added Cron Job
+- Added Cron Job (Agent & Monitor)
 - Created Video of Working Dashboard
 - Finalized Git Log
